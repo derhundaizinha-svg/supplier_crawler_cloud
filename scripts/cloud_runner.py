@@ -65,7 +65,8 @@ def is_cloud_http_supplier(supplier: dict) -> bool:
     if not supplier.get("is_active"):
         return False
     base_url = (supplier.get("base_url") or "").strip().lower()
-    if not base_url or base_url in ("nashi", "pdf"):
+    list_url = (supplier.get("list_url") or "").strip().lower()
+    if not base_url or base_url in ("nashi", "pdf") or list_url.startswith("whatsapp:"):
         return False
     if _is_alibaba1688(supplier):
         return False
