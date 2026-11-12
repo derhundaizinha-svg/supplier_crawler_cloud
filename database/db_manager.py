@@ -171,25 +171,58 @@ def _resolve_ssl_options(host: str, ssl_ca: str = None, use_ssl: bool = None) ->
 
 class DatabaseManager:
     def __init__(self, host, port, user, password, database, ssl_ca=None, use_ssl=None):
+        import os
+
         ssl_opts = _resolve_ssl_options(host, ssl_ca=ssl_ca, use_ssl=use_ssl)
         self.config = dict(host=host, port=port, user=user, password=password, database=database, **ssl_opts)
-        ssl_label = " [TLS]" if ssl_opts else ""
-        print(f"[DB] 测试连接 {host}:{port} 数据库={database}{ssl_label} ...", flush=True)
-        test_conn = mysql.connector.connect(
-            host=host, port=port, user=user, password=password,
-            database=database, connection_timeout=15, use_pure=True, **ssl_opts,
-        )
-        test_conn.close()
-        print("[DB] 单连接测试通过，创建连接池...", flush=True)
-        self.pool = pooling.MySQLConnectionPool(
-            pool_name="crawler_pool", pool_size=5,
+
+        host_norm = (host or "").strip().lower()
+        is_local = host_norm in ("127.0.0.1", "localhost", "::1", "")
+        pool_size = max(1, int(os.getenv("DB_POOL_SIZE", "5" if is_local else "1")))
+        connect_timeout = max(5, int(os.getenv("DB_CONNECT_TIMEOUT", "15")))
+        read_timeout = max(10, int(os.getenv("DB_READ_TIMEOUT", "60")))
+        write_timeout = max(10, int(os.getenv("DB_WRITE_TIMEOUT", "60")))
+
+        self._conn_kwargs = dict(
             **self.config,
             charset="utf8mb4",
             use_unicode=True,
             autocommit=False,
             use_pure=True,
-            connection_timeout=10,
+            connection_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            write_timeout=write_timeout,
         )
+
+        ssl_label = " [TLS]" if ssl_opts else ""
+        print(
+            f"[DB] 连接 {host}:{port} 数据库={database}{ssl_label} "
+            f"(pool_size={pool_size}, read_timeout={read_timeout}s) ...",
+            flush=True,
+        )
+        try:
+            self.pool = pooling.MySQLConnectionPool(
+                pool_name="crawler_pool",
+                pool_size=pool_size,
+                pool_reset_session=False,
+                **self._conn_kwargs,
+            )
+        except (AttributeError, TypeError, ValueError):
+            self._conn_kwargs.pop("read_timeout", None)
+            self._conn_kwargs.pop("write_timeout", None)
+            self.pool = pooling.MySQLConnectionPool(
+                pool_name="crawler_pool",
+                pool_size=pool_size,
+                pool_reset_session=False,
+                **self._conn_kwargs,
+            )
+
+        with self.connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            cur.close()
+        print("[DB] 连接池就绪", flush=True)
 
     @classmethod
     def from_env(
@@ -213,15 +246,40 @@ class DatabaseManager:
 
     @contextmanager
     def connection(self):
-        conn = self.pool.get_connection()
+        import time as _time
+
+        conn = None
+        for attempt in range(5):
+            try:
+                conn = self.pool.get_connection()
+                break
+            except pooling.PoolError:
+                if attempt < 4:
+                    _time.sleep(0.1 * (attempt + 1))
+                else:
+                    conn = mysql.connector.connect(**self._conn_kwargs)
+        try:
+            conn.ping(reconnect=True, attempts=2, delay=1)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = mysql.connector.connect(**self._conn_kwargs)
         try:
             yield conn
             conn.commit()
         except Exception:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             raise
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def init_schema(self):
         with self.connection() as conn:
@@ -413,13 +471,209 @@ class DatabaseManager:
         return pid or 0
 
     def bulk_upsert_products(self, products: list) -> int:
-        count = 0
+        if not products:
+            return 0
+        deduped_map = {}
+        order_keys = []
         for p in products:
-            try:
-                if self.upsert_product(p): count += 1
-            except Exception as e:
-                logger.error(f"商品入库失败 [{getattr(p,'name','?')}]: {e}")
-        return count
+            purl = (getattr(p, "product_url", "") or "").strip() or None
+            key = ("url", purl) if purl else ("name", p.supplier_id, (p.name or "")[:300])
+            if key not in deduped_map:
+                order_keys.append(key)
+            deduped_map[key] = p
+        items = [deduped_map[k] for k in order_keys]
+        try:
+            return self._bulk_upsert_products_batched(items)
+        except Exception as e:
+            logger.warning(f"批量入库回退逐条模式 ({len(items)} 条): {e}")
+            count = 0
+            for p in items:
+                try:
+                    if self.upsert_product(p):
+                        count += 1
+                except Exception as item_err:
+                    logger.error(f"商品入库失败 [{getattr(p, 'name', '?')}]: {item_err}")
+            return count
+
+    def _bulk_upsert_products_batched(self, items: list) -> int:
+        existing_by_url = {}
+        existing_by_name = {}
+        unique_urls = list(dict.fromkeys((getattr(p, "product_url", "") or "").strip() for p in items if (getattr(p, "product_url", "") or "").strip()))
+        no_url_items = [p for p in items if not ((getattr(p, "product_url", "") or "").strip())]
+
+        with self.connection() as conn:
+            cursor = conn.cursor(buffered=True)
+            for i in range(0, len(unique_urls), 500):
+                chunk = unique_urls[i:i + 500]
+                ph = ",".join(["%s"] * len(chunk))
+                cursor.execute(
+                    f"SELECT id, price, category, product_url FROM products WHERE product_url IN ({ph}) ORDER BY id ASC",
+                    tuple(chunk),
+                )
+                for pid, price, cat, purl in cursor.fetchall():
+                    existing_by_url.setdefault(purl, (int(pid), float(price), cat or ""))
+
+            if no_url_items:
+                names_by_sid = {}
+                for p in no_url_items:
+                    names_by_sid.setdefault(int(p.supplier_id), []).append((p.name or "")[:300])
+                for sid, raw_names in names_by_sid.items():
+                    uniq_names = list(dict.fromkeys(raw_names))
+                    for i in range(0, len(uniq_names), 300):
+                        chunk = uniq_names[i:i + 300]
+                        ph = ",".join(["%s"] * len(chunk))
+                        cursor.execute(
+                            f"SELECT id, price, category, name FROM products WHERE supplier_id=%s AND name IN ({ph}) ORDER BY id ASC",
+                            (sid, *chunk),
+                        )
+                        for pid, price, cat, nm in cursor.fetchall():
+                            existing_by_name.setdefault((sid, nm), (int(pid), float(price), cat or ""))
+
+            updates_by_id = {}
+            to_insert = []
+            price_history_rows = []
+            for p in items:
+                purl = (getattr(p, "product_url", "") or "").strip() or None
+                matched = (
+                    existing_by_url.get(purl)
+                    if purl
+                    else existing_by_name.get((int(p.supplier_id), (p.name or "")[:300]))
+                )
+                new_price = float(p.price)
+                if matched:
+                    pid, old_price, existing_cat = matched
+                    keep_cat = existing_cat if (existing_cat and str(existing_cat).strip()) else (p.category or "")
+                    updates_by_id[pid] = (pid, p, new_price, keep_cat)
+                    if abs(new_price - old_price) > 0.001:
+                        price_history_rows.append((pid, new_price))
+                else:
+                    to_insert.append((purl, p))
+
+            to_update = list(updates_by_id.values())
+            col_specs = [
+                ("name", lambda r: (r[1].name or "")[:300]),
+                ("sku", lambda r: r[1].sku or ""),
+                ("description", lambda r: (r[1].description or "")[:500]),
+                ("price", lambda r: r[2]),
+                ("stock", lambda r: r[1].stock),
+                ("image_url", lambda r: r[1].image_url or ""),
+                ("image_local", lambda r: getattr(r[1], "image_local_path", "") or ""),
+                ("category", lambda r: r[3]),
+                ("brand", lambda r: r[1].brand or ""),
+                ("unit", lambda r: getattr(r[1], "unit", "") or ""),
+                ("min_qty", lambda r: int(getattr(r[1], "min_qty", 1) or 1)),
+                ("package_qty", lambda r: int(getattr(r[1], "package_qty", 1) or 1)),
+            ]
+            for i in range(0, len(to_update), 100):
+                chunk = to_update[i:i + 100]
+                pids = [r[0] for r in chunk]
+                whens = " ".join(["WHEN %s THEN %s"] * len(chunk))
+                set_clauses = []
+                params = []
+                for col_name, getter in col_specs:
+                    set_clauses.append(f"{col_name} = CASE id {whens} END")
+                    for r in chunk:
+                        params.append(r[0])
+                        params.append(getter(r))
+                id_ph = ",".join(["%s"] * len(pids))
+                params.extend(pids)
+                cursor.execute(
+                    f"UPDATE products SET {', '.join(set_clauses)}, is_available=1, updated_at=NOW() WHERE id IN ({id_ph})",
+                    tuple(params),
+                )
+
+            if to_insert:
+                ins_sids = sorted({int(p.supplier_id) for _, p in to_insert})
+                sid_ph = ",".join(["%s"] * len(ins_sids))
+                is_new_map = {}
+                try:
+                    cursor.execute(
+                        f"""SELECT s.id,
+                                   TIMESTAMPDIFF(HOUR, s.created_at, NOW()) > 24
+                                   AND (SELECT COUNT(*) FROM products p WHERE p.supplier_id=s.id AND p.is_available=1) > 100
+                            FROM suppliers s WHERE s.id IN ({sid_ph})""",
+                        tuple(ins_sids),
+                    )
+                    for sid_val, flag in cursor.fetchall():
+                        is_new_map[int(sid_val)] = 1 if flag else 0
+                except Exception:
+                    pass
+
+                row_ph = "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s)"
+                for i in range(0, len(to_insert), 100):
+                    chunk = to_insert[i:i + 100]
+                    params = []
+                    for purl, p in chunk:
+                        min_q = int(getattr(p, 'min_qty', 1) or 1)
+                        pkg_q = int(getattr(p, 'package_qty', 1) or 1)
+                        params.extend([
+                            p.supplier_id, (p.name or '')[:300], p.sku or '',
+                            p.category or '', p.brand or '',
+                            float(p.price), p.currency or 'ARS',
+                            getattr(p, 'unit', '') or '',
+                            min_q, pkg_q,
+                            p.stock, (p.description or '')[:500],
+                            p.image_url or '', getattr(p, 'image_local_path', '') or '', purl,
+                            is_new_map.get(int(p.supplier_id), 0),
+                        ])
+                    values_sql = ",".join([row_ph] * len(chunk))
+                    cursor.execute(
+                        f"""INSERT INTO products
+                           (supplier_id,name,sku,category,brand,price,currency,unit,
+                            min_qty,package_qty,
+                            stock,description,image_url,image_local,product_url,is_available,is_new)
+                           VALUES {values_sql}""",
+                        tuple(params),
+                    )
+
+                ins_urls = [purl for purl, _ in to_insert if purl]
+                ins_id_by_url = {}
+                for i in range(0, len(ins_urls), 500):
+                    chunk = ins_urls[i:i + 500]
+                    ph = ",".join(["%s"] * len(chunk))
+                    cursor.execute(
+                        f"SELECT id, product_url FROM products WHERE product_url IN ({ph}) ORDER BY id DESC",
+                        tuple(chunk),
+                    )
+                    for pid, purl in cursor.fetchall():
+                        ins_id_by_url.setdefault(purl, int(pid))
+
+                ins_no_url_by_sid = {}
+                for purl, p in to_insert:
+                    if not purl:
+                        ins_no_url_by_sid.setdefault(int(p.supplier_id), []).append((p.name or "")[:300])
+                ins_id_by_name = {}
+                for sid, nms in ins_no_url_by_sid.items():
+                    uniq_nms = list(dict.fromkeys(nms))
+                    for i in range(0, len(uniq_nms), 300):
+                        chunk = uniq_nms[i:i + 300]
+                        ph = ",".join(["%s"] * len(chunk))
+                        cursor.execute(
+                            f"SELECT id, name FROM products WHERE supplier_id=%s AND name IN ({ph}) ORDER BY id DESC",
+                            (sid, *chunk),
+                        )
+                        for pid, nm in cursor.fetchall():
+                            ins_id_by_name.setdefault((sid, nm), int(pid))
+
+                for purl, p in to_insert:
+                    pid = (
+                        ins_id_by_url.get(purl)
+                        if purl
+                        else ins_id_by_name.get((int(p.supplier_id), (p.name or "")[:300]))
+                    )
+                    if pid:
+                        price_history_rows.append((pid, float(p.price)))
+
+            for i in range(0, len(price_history_rows), 500):
+                chunk = price_history_rows[i:i + 500]
+                ph = ",".join(["(%s,%s)"] * len(chunk))
+                flat = []
+                for pid, pr in chunk:
+                    flat.extend((pid, pr))
+                cursor.execute(f"INSERT INTO price_history (product_id,price) VALUES {ph}", tuple(flat))
+
+            cursor.close()
+        return len(items)
 
     def get_existing_product_names(self, supplier_id: int) -> set:
         """获取某供应商所有在售商品名集合，用于断点续传跳过已爬商品"""
