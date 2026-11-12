@@ -153,15 +153,40 @@ def harvest_drive_file_ids(db: DatabaseManager) -> int:
 def _apply_drive_id_updates(db: DatabaseManager, id_map: list) -> int:
     if not id_map:
         return 0
-    updated = 0
+    dedup: Dict[int, str] = {}
+    for cid, pid in id_map:
+        if cid and pid:
+            dedup[int(pid)] = str(cid)
+    if not dedup:
+        return 0
+
     with db.connection() as conn:
         cursor = conn.cursor()
+        cursor.execute("SELECT id, drive_file_id FROM products")
+        existing = {int(pid): (did or "") for pid, did in cursor.fetchall()}
+
+        pending = [
+            (pid, cid)
+            for pid, cid in dedup.items()
+            if pid in existing and existing[pid] != cid
+        ]
+        if not pending:
+            cursor.close()
+            return 0
+
+        updated = 0
         batch_size = 500
-        for i in range(0, len(id_map), batch_size):
-            batch = id_map[i:i + batch_size]
-            cursor.executemany(
-                "UPDATE products SET drive_file_id = %s WHERE id = %s AND (drive_file_id IS NULL OR drive_file_id != %s)",
-                [(cid, pid, cid) for cid, pid in batch],
+        for i in range(0, len(pending), batch_size):
+            batch = pending[i:i + batch_size]
+            cases = " ".join(["WHEN %s THEN %s"] * len(batch))
+            placeholders = ", ".join(["%s"] * len(batch))
+            params = []
+            for pid, cid in batch:
+                params.extend([pid, cid])
+            params.extend([pid for pid, _ in batch])
+            cursor.execute(
+                f"UPDATE products SET drive_file_id = CASE id {cases} END WHERE id IN ({placeholders})",
+                params,
             )
             updated += max(cursor.rowcount, 0)
         cursor.close()
